@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ennatzauge"
+version = "0.2.0"
+description = "Football video analysis and YOLO training"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ultralytics>=8.3",
+    "numpy",
+    "opencv-python",
+    "pyyaml",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+# OpenVINO is a large download but several times faster than PyTorch on CPU.
+cpu = ["openvino>=2024"]
+dev = ["pytest"]
+
+[project.scripts]
+ennatzauge = "EnnatzAuge.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

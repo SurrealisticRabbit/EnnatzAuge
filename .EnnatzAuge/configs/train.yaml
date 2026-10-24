@@ -1,0 +1,44 @@
+# ennatzauge train
+#
+# Paths are relative to the EnnatzAuge root, so this works from any directory.
+# Anything omitted falls back to the defaults in train/jobs.py.
+
+jobs:
+  - name: players
+    run_name: players          # pinned, so re-running resumes this run
+    data: datasets/yolo-players/data.yaml
+    model: yolo26m.pt
+    gpus: 1
+    epochs: 80
+    imgsz: 1280
+    batch: -1              # -1 profiles the GPU actually allocated
+    workers: 8
+    cache: false           # true/disk need ~53 GB of decoded frames
+    patience: 60           # counted in EPOCHS, not validations
+    save_period: 5
+    dataset_skip_interval: 5   # every 5th frame, within every sequence
+    val_stride: 10
+    val_every: 1           # keep at 1 if best.pt matters
+    mosaic: 0.5
+    close_mosaic: 25
+    fliplr: 0.5
+
+  - name: pitch
+    run_name: pitch            # pinned, so re-running resumes this run
+    data: datasets/yolo-pitch/data.yaml
+    model: yolo26m-pose.pt
+    gpus: 1
+    epochs: 80
+    imgsz: 1280
+    batch: -1
+    workers: 8
+    cache: false
+    patience: 60
+    save_period: 5
+    dataset_skip_interval: 5
+    val_stride: 10
+    val_every: 1
+    mosaic: 0.5
+    close_mosaic: 25
+    # fliplr is driven by flip_idx in data.yaml; leave it alone so the
+    # left/right keypoint swap stays correct.

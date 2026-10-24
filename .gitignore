@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# Local EnnatzAuge home: datasets, checkpoints and rendered video are large
+# and reproducible. Keep the config files, ignore the rest.
+.EnnatzAuge/datasets/
+.EnnatzAuge/input_video/
+.EnnatzAuge/models/
+
+# Ultralytics writes these next to whatever it is pointed at.
+*_openvino_model/
+yolo*.pt
+runs/
