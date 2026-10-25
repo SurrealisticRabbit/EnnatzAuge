@@ -35,14 +35,46 @@ class OverlayedVideo:
             x1, y1, x2, y2 = (int(v) for v in obj.bbox)
             color = CLASS_COLORS.get(obj.class_name, DEFAULT_COLOR)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f"{obj.class_name} {obj.confidence:.2f}",
-                        (x1, max(y1 - 6, 0)), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, color, 1, cv2.LINE_AA)
+
+            track_id = getattr(obj, "track_id", 0)
+            label = f"{obj.class_name} {obj.confidence:.2f}"
+            if track_id:
+                label = f"#{track_id} {label}"
+            speed = getattr(obj, "speed", 0.0)
+            if speed > 0.5:
+                label = f"{label} {speed:.1f}m/s"
+            cv2.putText(frame, label, (x1, max(y1 - 6, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+            # A dim marker at the projected heel helps see which box produced
+            # which dot on the virtual pitch.
+            if obj.image_position is not None:
+                point = (int(obj.image_position[0]), int(obj.image_position[1]))
+                cv2.drawMarker(frame, point, color, cv2.MARKER_CROSS, 10, 1)
 
         for x, y in state.keypoints:
             cv2.circle(frame, (int(round(x)), int(round(y))), 4,
                        KEYPOINT_COLOR, -1)
+
+        self._draw_status(frame, state)
         return frame
+
+    @staticmethod
+    def _draw_status(frame, state) -> None:
+        if state.homography_held:
+            label, color = "homography HELD OVER", (60, 170, 230)
+        elif state.homography_ok:
+            label = f"homography {state.homography_quality:.2f}"
+            color = (140, 210, 140)
+        else:
+            label, color = f"no homography: {state.homography_reason}", (90, 90, 220)
+
+        cv2.putText(frame, label, (14, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, color, 2, cv2.LINE_AA)
+        if state.camera is not None:
+            cv2.putText(frame, state.camera.summary(), (14, 52),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1,
+                        cv2.LINE_AA)
 
     def render(self, output_video: str) -> Path:
         cap = cv2.VideoCapture(str(self.input_video))

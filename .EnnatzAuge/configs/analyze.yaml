@@ -1,17 +1,30 @@
-# ennatzauge analyze
+﻿# ennatzauge analyze
 #
-# Paths are relative to the EnnatzAuge root. Omit any key to use the default:
-# video is the first clip in input_video/, checkpoints are the newest matching
-# run under models/runs, output goes to models/analysis/latest.
+# Every key here is a default; a command-line flag always wins. Paths are
+# resolved against the EnnatzAuge root, not the current directory.
 
 video: input_video/fb_cut.mp4
+
 frames: 0            # 0 = to the end of the clip
-start: 0
+start_frame: 0
 imgsz: 1280
-chunk: 16            # frames per inference call; bounds peak memory
+chunk_size: 0        # 0 = auto (decode 16+, infer in the largest batch that fits)
+
 scale: 10            # pixels per metre in the virtual pitch
-openvino: true
+
+# There is no device or backend setting: analysis picks the fastest path the
+# machine offers (CUDA fp16 > MPS > OpenVINO on CPU > plain PyTorch CPU).
+# Override only for debugging, e.g.
+#   ENNATZAUGE_DEVICE=cpu  ENNATZAUGE_BACKEND=torch  ennatzauge analyze
+
+# Temporal prior on the homography. 0 = fit every frame from the data alone
+# (recommended). Values above 0 make the fit believe the previous frame, which
+# reduces jitter but also damps genuine camera pans: measured, it recovers only
+# ~87% of the camera displacement. Object positions are smoothed in pitch space
+# instead, where the filter cannot bias the trajectory.
+smoothing: 0.0
 
 # Leave these out to pick the newest players-*/best.pt and pitch-*/best.pt.
 # players: models/runs/players-67dcf7c0/weights/best.pt
 # pitch: models/runs/pitch-0d3e9c7c/weights/best.pt
+# output: models/analysis/latest

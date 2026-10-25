@@ -84,20 +84,63 @@ class PositionVideo:
         if not state.homography_ok:
             cv2.putText(canvas, "no homography this frame", (12, 26),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (90, 90, 220), 2, cv2.LINE_AA)
+            self._draw_status(canvas, state)
             return canvas
 
         for obj in state.all_objects():
             if obj.current_position is None:
                 continue
-            x, y = obj.current_position
-            point = (int(round(x * scale)) + margin, int(round(y * scale)) + margin)
             color = CLASS_COLORS.get(obj.class_name, (200, 200, 200))
-            cv2.circle(canvas, point, 6, color, -1)
-            cv2.circle(canvas, point, 6, (20, 20, 20), 1)
 
+            # Trails make direction of travel readable at a glance; the last
+            # third of the history is enough without turning the pitch into a
+            # tangle of lines.
+            trail = getattr(obj, "trail", None) or []
+            if len(trail) > 2:
+                points = [self._point(x, y, scale, margin) for x, y in trail]
+                for index in range(1, len(points)):
+                    weight = index / len(points)
+                    shade = tuple(int(c * weight) for c in color)
+                    cv2.line(canvas, points[index - 1], points[index], shade, 2)
+
+            x, y = obj.current_position
+            point = self._point(x, y, scale, margin)
+            radius = 4 if obj.class_name == "ball" else 7
+            cv2.circle(canvas, point, radius, color, -1)
+            cv2.circle(canvas, point, radius, (20, 20, 20), 1)
+
+            track_id = getattr(obj, "track_id", 0)
+            if track_id and obj.class_name != "ball":
+                cv2.putText(canvas, str(track_id), (point[0] + radius + 2, point[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (230, 230, 230), 1,
+                            cv2.LINE_AA)
+
+        self._draw_status(canvas, state)
+        return canvas
+
+    @staticmethod
+    def _point(x_m: float, y_m: float, scale: float, margin: int) -> tuple[int, int]:
+        return (int(round(x_m * scale)) + margin, int(round(y_m * scale)) + margin)
+
+    def _draw_status(self, canvas: np.ndarray, state) -> None:
+        """Projection count plus the recovered camera pose."""
         cv2.putText(canvas, f"{state.projected} on pitch", (12, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
-        return canvas
+
+        if state.camera is not None:
+            cv2.putText(canvas, state.camera.summary(), (12, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 200, 170), 1,
+                        cv2.LINE_AA)
+
+        if state.homography_held:
+            label, color = "homography held over", (90, 170, 220)
+        elif state.homography_ok:
+            label = f"fit {state.homography_quality:.2f}"
+            color = (170, 200, 170)
+        else:
+            label, color = state.homography_reason or "no fit", (90, 90, 220)
+        cv2.putText(canvas, label, (12, canvas.shape[0] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     def render(self, output_video: str) -> Path:
         template = pitch_template(self.virtual_pitch.scale)

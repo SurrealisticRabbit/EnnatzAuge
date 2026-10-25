@@ -61,10 +61,18 @@ class Job:
     close_mosaic: int = 10
     fliplr: float = 0.5
 
+    # --- optimisation -----------------------------------------------------
+    # 0 leaves Ultralytics' own default (lr0=0.01 with optimizer=auto). Lowering
+    # it is the cheapest thing to try when a small model plateaus early.
+    lr0: float = 0.0
+    optimizer: str = ""             # auto / SGD / AdamW / ...
+
     # --- housekeeping -----------------------------------------------------
     # Copy checkpoints somewhere durable every N epochs (a mounted volume, an
     # rclone target, anything the host can lose). Empty = no mirroring.
     checkpoint_mirror: str = ""
+    # Redraw a live metric chart each epoch. Only draws on a tty.
+    live_chart: bool = True
     clear_stop_on_start: bool = True
 
     # Pin this in the config to make re-running resume the same run instead of
@@ -102,7 +110,9 @@ class Job:
 
     @property
     def best(self) -> dict | None:
-        return max(self.history, key=lambda r: r["mAP_50_95"], default=None)
+        """Highest-fitness epoch, matching how Ultralytics picks ``best.pt``."""
+        return max(self.history, key=lambda r: r.get("fitness", r["mAP_50_95"]),
+                   default=None)
 
     def resolved_devices(self) -> list[int]:
         """Device indices to train on.

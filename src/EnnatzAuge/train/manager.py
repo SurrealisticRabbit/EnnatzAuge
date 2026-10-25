@@ -153,7 +153,12 @@ def list_runs(project: Path | str) -> list[dict]:
         out.append({
             "run_name": run_dir.name,
             "epochs_done": rows[-1]["epoch"] if rows else 0,
+            # fitness, not mAP50-95 alone: it is what picks best.pt.
+            "best_fitness": max((r["fitness"] for r in rows), default=0.0),
             "best_mAP_50_95": max((r["mAP_50_95"] for r in rows), default=0.0),
+            "best_epoch": (max(rows, key=lambda r: r["fitness"])["epoch"]
+                           if rows else 0),
+            "is_pose": any(r.get("pose_mAP_50_95") is not None for r in rows),
             "last_pt_mb": round(last.stat().st_size / 1e6, 1) if last.exists() else 0.0,
             "has_best": best.exists(),
             "stopped": (run_dir / "STOP").exists(),

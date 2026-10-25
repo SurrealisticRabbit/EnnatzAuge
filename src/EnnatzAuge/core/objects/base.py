@@ -21,6 +21,14 @@ class BaseObject:
         self.bbox: tuple[float, float, float, float] | None = None
         self.image_position: tuple[float, float] | None = None
 
+        # Populated by the tracker. ``track_id`` is stable across frames, which
+        # is what makes positions comparable over time; ``speed`` is m/s on the
+        # pitch plane and ``trail`` the recent smoothed positions.
+        self.track_id: int = 0
+        self.speed: float = 0.0
+        self.trail: list[tuple[float, float]] = []
+        self.measured: bool = True
+
     def __repr__(self) -> str:
         x, y = self.current_position if self.current_position else (None, None)
         if x is None:

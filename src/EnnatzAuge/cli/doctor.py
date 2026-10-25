@@ -296,7 +296,34 @@ def check_openvino(report: Report) -> None:
     except ImportError:
         report.add("openvino", "skip", "not installed",
                    'pip install -e ".[cpu]" for much faster CPU inference '
-                   '(analysis only, not training)')
+                   '(only used when there is no GPU)')
+
+
+def check_analysis_backend(report: Report) -> None:
+    """What `ennatzauge analyze` will actually run on.
+
+    Worth checking explicitly: the pipeline defaults to whatever is fastest, and
+    a missing CUDA build silently means two hours of CPU inference instead of
+    two minutes of GPU.
+    """
+    try:
+        from ..core.models import hardware
+
+        backend = hardware.select()
+    except Exception as exc:                      # pragma: no cover - defensive
+        report.add("analysis", "warn", f"could not select a backend: {exc}")
+        return
+
+    detail = (f"{backend.describe()}, batch {backend.max_batch}")
+    if backend.format == "torch" and backend.torch_device.startswith("cuda"):
+        report.add("analysis", "ok", detail)
+    elif backend.format == "openvino":
+        report.add("analysis", "ok", detail,
+                   "GPU would be much faster here; install a CUDA torch build "
+                   "to use one")
+    else:
+        report.add("analysis", "ok", detail,
+                   "slowest option: no CUDA and no OpenVINO available")
 
 
 def check_gpu(report: Report) -> dict:
@@ -464,9 +491,9 @@ def run(args: argparse.Namespace) -> int:
     check_datasets(report, paths)
     check_models(report, paths)
     check_filesystem(report, paths)
-    check_openvino(report)
-
     gpu = check_gpu(report)
+    check_openvino(report)
+    check_analysis_backend(report)
     recommend(report, gpu)
 
     if args.json:

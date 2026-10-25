@@ -25,7 +25,7 @@ OVERRIDABLE = {
     "epochs": int, "imgsz": int, "batch": float, "gpus": int,
     "patience": int, "workers": int, "save_period": int,
     "dataset_skip_interval": int, "val_stride": int, "val_every": int,
-    "mosaic": float, "close_mosaic": int, "fliplr": float,
+    "mosaic": float, "close_mosaic": int, "fliplr": float, "lr0": float,
 }
 
 
@@ -39,6 +39,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help="print the resolved jobs and exit")
     parser.add_argument("--model",
                         help="override the starting weights for every job")
+    parser.add_argument("--no-chart", action="store_true",
+                        help="no live metric chart (useful for logs and CI)")
     for key, kind in OVERRIDABLE.items():
         parser.add_argument(f"--{key.replace('_', '-')}", dest=key, type=kind,
                             help=f"override {key}")
@@ -69,6 +71,8 @@ def _jobs_from_args(paths: Paths, args: argparse.Namespace) -> list[Job]:
                  if getattr(args, k, None) is not None}
     if args.model:
         overrides["model"] = args.model
+    if args.no_chart:
+        overrides["live_chart"] = False
 
     jobs = []
     for spec in raw_jobs:

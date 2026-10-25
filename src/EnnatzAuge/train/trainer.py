@@ -21,7 +21,18 @@ from typing import Any
 
 
 def read_history(results_csv: Path) -> list[dict]:
-    """Parse Ultralytics' results.csv into per-epoch rows."""
+    """Parse Ultralytics' results.csv into per-epoch rows.
+
+    Handles both detect and pose CSVs. For pose the interesting number is the
+    *pose* metric: ``mAP50-95(B)`` only scores the whole-frame bounding box,
+    which is trivially easy and reads ~0.97 while the keypoints are still poor.
+    ``fitness`` reproduces Ultralytics' own score so "best epoch" matches
+    ``best.pt``: 0.1*mAP50 + 0.9*mAP50-95, summed over box and pose for pose
+    tasks (see ``PoseMetrics.fitness``).
+
+    Also reports the loss columns each task actually has: detect uses
+    box/cls/dfl, pose uses box/cls/dfl plus pose/kobj, and segment uses seg.
+    """
     path = Path(results_csv)
     if not path.exists():
         return []
@@ -32,6 +43,9 @@ def read_history(results_csv: Path) -> list[dict]:
         except (TypeError, ValueError):
             return 0.0
 
+    def has(row: dict, key: str) -> bool:
+        return key in row and row[key] not in ("", None)
+
     rows = []
     with open(path, newline="", encoding="utf-8") as handle:
         for raw in csv.DictReader(handle):
@@ -40,12 +54,36 @@ def read_history(results_csv: Path) -> list[dict]:
                 epoch = int(float(row["epoch"]))
             except (KeyError, ValueError):
                 continue
+
+            is_pose = has(row, "metrics/mAP50-95(P)")
+            box_50 = num(row, "metrics/mAP50(B)")
+            box_95 = num(row, "metrics/mAP50-95(B)")
+
+            if is_pose:
+                pose_50 = num(row, "metrics/mAP50(P)")
+                pose_95 = num(row, "metrics/mAP50-95(P)")
+                # Headline numbers follow the task, not the box.
+                headline_50, headline_95 = pose_50, pose_95
+                fitness = (0.1 * pose_50 + 0.9 * pose_95
+                           + 0.1 * box_50 + 0.9 * box_95)
+            else:
+                pose_50 = pose_95 = None
+                headline_50, headline_95 = box_50, box_95
+                fitness = 0.1 * box_50 + 0.9 * box_95
+
+            losses = [k for k in ("box", "cls", "dfl", "pose", "kobj", "seg")
+                      if has(row, f"train/{k}_loss")]
+
             rows.append({
                 "epoch": epoch,
-                "mAP_50": num(row, "metrics/mAP50(B)"),
-                "mAP_50_95": num(row, "metrics/mAP50-95(B)"),
-                "loss": sum(num(row, f"train/{k}_loss")
-                            for k in ("box", "cls", "dfl")),
+                "mAP_50": headline_50,
+                "mAP_50_95": headline_95,
+                "box_mAP_50": box_50,
+                "box_mAP_50_95": box_95,
+                "pose_mAP_50": pose_50,
+                "pose_mAP_50_95": pose_95,
+                "fitness": fitness,
+                "loss": sum(num(row, f"train/{k}_loss") for k in losses),
                 "lr": num(row, "lr/pg0"),
             })
     return rows
@@ -166,8 +204,9 @@ def resolve_data_yaml(data_path: str, run_name: str,
     return str(out)
 
 
-def epoch_control(trainer, val_every: int, stop_marker: str) -> None:
-    """Per-epoch hook: throttle validation, honour a stop request.
+def epoch_control(trainer, val_every: int, stop_marker: str,
+                  chart=None, results_csv: str | None = None) -> None:
+    """Per-epoch hook: throttle validation, honour a stop request, redraw chart.
 
     Runs from ``on_train_epoch_end``, which Ultralytics fires *before* the
     ``if self.args.val`` check, so setting ``trainer.args.val`` here decides
@@ -175,12 +214,22 @@ def epoch_control(trainer, val_every: int, stop_marker: str) -> None:
 
     Takes plain values rather than closing over objects: under DDP the trainer
     is pickled into a generated launch script, and a closure holding something
-    unpicklable (a socket, an SDK client) breaks the launch.
+    unpicklable (a socket, an SDK client) breaks the launch. The ``chart``
+    argument is a plain object holding only lists, so it pickles fine.
     """
     epoch = trainer.epoch + 1
     every = max(1, int(val_every))
     trainer.args.val = bool(epoch >= trainer.epochs or every == 1
                             or epoch % every == 0)
+
+    if chart is not None and results_csv:
+        try:
+            rows = read_history(Path(results_csv))
+            if rows:
+                chart.add(rows[-1])
+                chart.draw()
+        except Exception:
+            pass  # a broken chart must never stop training
 
     if stop_marker and Path(stop_marker).exists():
         print(f"  [stop] requested at epoch {epoch}; finishing this epoch", flush=True)
@@ -309,9 +358,21 @@ def run_job(job, stop_marker: Path | None = None) -> dict:
     if job.clear_stop_on_start and marker.exists():
         marker.unlink()
 
+    results_csv = run_dir / "results.csv"
+    chart = None
+    if getattr(job, "live_chart", True):
+        from .plot import LiveChart
+
+        # Prime the chart with whatever is already on disk, so resuming does
+        # not start from an empty plot.
+        chart = LiveChart(title=f"  {job.run_name}")
+        for row in read_history(results_csv):
+            chart.add(row)
+
     model.add_callback(
         "on_train_epoch_end",
-        lambda trainer: epoch_control(trainer, val_every, str(marker)),
+        lambda trainer: epoch_control(trainer, val_every, str(marker),
+                                      chart, str(results_csv)),
     )
 
     mirror = CheckpointMirror(run_dir, job.checkpoint_mirror or None, marker)
@@ -320,6 +381,11 @@ def run_job(job, stop_marker: Path | None = None) -> dict:
           f"on device={device}", flush=True)
 
     started = time.time()
+    tuning = {}
+    if job.lr0 and job.lr0 > 0:
+        tuning["lr0"] = job.lr0
+    if job.optimizer:
+        tuning["optimizer"] = job.optimizer
     try:
         model.train(
             data=data_yaml,
@@ -339,9 +405,12 @@ def run_job(job, stop_marker: Path | None = None) -> dict:
             mosaic=job.mosaic,
             close_mosaic=job.close_mosaic,
             fliplr=job.fliplr,
+            **tuning,
         )
     finally:
         mirror.stop()
+        if chart is not None:
+            chart.finish()
 
     history = read_history(run_dir / "results.csv")
     return {

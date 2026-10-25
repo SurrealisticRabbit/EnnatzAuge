@@ -1,0 +1,59 @@
+﻿# ennatzauge train --config experiment
+#
+# Cheap experiments, not production runs. Each answers one question about the
+# two models already trained (players-io-1 / pitch-io-1), at roughly a tenth of
+# the cost: a nano model at 960 with two thirds of the frame budget.
+#
+# Why these two:
+#   * nano @ 960  -- is a small model at a smaller resolution actually worse?
+#     If it is within a few points, every future run gets ~6x cheaper.
+#   * lr0 0.005   -- players-io-1 plateaued around epoch 15 with a fitness
+#     standard deviation of 0.025, which is the classic signature of too high a
+#     step size for the data it has.
+#
+# Compare against the baselines with `ennatzauge status`:
+#   players-io-1  detect  mAP50-95 0.3444  fitness 0.3650
+#   pitch-io-1    pose    mAP50-95 0.5781  fitness 1.3357
+#
+# Reference point on cost: at 1280 with batch -1, an L40 did 80 epochs of the
+# pose model in about 35 minutes. These should finish in well under 15.
+
+jobs:
+  - name: quick-players
+    run_name: quick-players
+    data: datasets/yolo-players/data.yaml
+    model: yolo26n.pt
+    gpus: 1
+    epochs: 60
+    imgsz: 960
+    batch: -1
+    workers: 8
+    cache: false
+    patience: 20              # a cheap run should stop early, not grind
+    save_period: 10
+    dataset_skip_interval: 10
+    val_stride: 20
+    val_every: 1
+    mosaic: 0.3
+    close_mosaic: 15
+    fliplr: 0.5
+    lr0: 0.005
+
+  - name: quick-pitch
+    run_name: quick-pitch
+    data: datasets/yolo-pitch/data.yaml
+    model: yolo26n-pose.pt
+    gpus: 1
+    epochs: 60
+    imgsz: 960
+    batch: -1
+    workers: 8
+    cache: false
+    patience: 20
+    save_period: 10
+    dataset_skip_interval: 10
+    val_stride: 20
+    val_every: 1
+    mosaic: 0.3
+    close_mosaic: 15
+    lr0: 0.005

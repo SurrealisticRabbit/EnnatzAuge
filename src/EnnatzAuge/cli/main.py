@@ -53,13 +53,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not runs:
         print(f"no runs under {paths.runs}")
         return 0
-    print(f"{'run':<30}{'epochs':>7}{'best mAP50-95':>15}{'last.pt MB':>12}  notes")
+
+    print(f"{'run':<22}{'task':<7}{'epochs':>7}{'best ep':>8}"
+          f"{'mAP50-95':>10}{'fitness':>9}{'last.pt':>9}  notes")
     for run in runs:
-        notes = "best.pt present" if run["has_best"] else "no best.pt"
+        task = "pose" if run["is_pose"] else "detect"
+        notes = [] if run["has_best"] else ["no best.pt"]
         if run["stopped"]:
-            notes += ", STOP requested"
-        print(f"{run['run_name']:<30}{run['epochs_done']:>7}"
-              f"{run['best_mAP_50_95']:>15.4f}{run['last_pt_mb']:>12.1f}  {notes}")
+            notes.append("STOP requested")
+        if run["last_pt_mb"] == 0:
+            notes.append("no last.pt")
+        print(f"{run['run_name']:<22}{task:<7}{run['epochs_done']:>7}"
+              f"{run['best_epoch']:>8}{run['best_mAP_50_95']:>10.4f}"
+              f"{run['best_fitness']:>9.4f}{run['last_pt_mb']:>9.1f}"
+              f"  {', '.join(notes)}")
+
+    if any(run["is_pose"] for run in runs):
+        print("\npose runs: mAP50-95 is the keypoint metric. The box metric is "
+              "not shown —\nit scores only the whole-frame box and reads ~0.97 "
+              "regardless of keypoint quality.")
     return 0
 
 
