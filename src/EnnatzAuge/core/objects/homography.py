@@ -470,8 +470,6 @@ def _solve_with_prior(inlier_image, inlier_pitch, prior_footprint, width: int,
         return None
     frame = np.asarray([[0, 0], [width, 0], [width, height], [0, height]],
                        dtype=np.float32)
-    frame = np.asarray([[0, 0], [width, 0], [width, height], [0, height]],
-                       dtype=np.float32)
     # Rows must line up with the direction being solved: pitch metres first,
     # image pixels second, for the real keypoints and the prior alike.
     source = np.vstack([np.asarray(inlier_pitch, np.float32)] +

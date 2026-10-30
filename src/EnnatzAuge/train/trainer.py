@@ -89,7 +89,9 @@ def read_history(results_csv: Path) -> list[dict]:
     return rows
 
 
-def resolve_batch(model, imgsz: int, spec: float, devices) -> tuple[int, int]:
+def resolve_batch(model, imgsz: int, spec: float, devices,
+                  vram_gb: float = 0.0, vram_fraction: float = 0.0,
+                  amp: bool = True, dataset_size: int = 0) -> tuple[int, int]:
     """Return ``(total_batch, per_gpu_batch)`` for the GPUs in use.
 
     ``args.batch`` is the TOTAL across all GPUs, so a per-GPU figure has to be
@@ -98,32 +100,67 @@ def resolve_batch(model, imgsz: int, spec: float, devices) -> tuple[int, int]:
     ``spec``:
       * ``>= 1``          explicit total, used as given
       * ``0 < spec < 1``  profile using that fraction of VRAM
-      * ``<= 0``          profile using 60% of VRAM
+      * ``<= 0``          profile using this job's VRAM budget, 60% without one
 
-    Ultralytics' own ``batch=-1`` is not usable under DDP: it only resolves when
+    Profiling is what turns a large card into a large batch: on a 192 GB
+    accelerator the answer is routinely four to eight times what a
+    workstation card allows, and it is also the only number that is right for
+    both a 24 GB and a 192 GB device without hand-tuning.
+
+    ``dataset_size`` bounds the result. A batch larger than the training set
+    spends an epoch in a single step, which distorts the LR schedule far more
+    than the bigger batch helps.
+
+    Ultralytics' own ``batch=-1`` is not usable here: it only resolves when
     ``RANK == -1``, so worker ranks keep the literal -1.
     """
-    import torch
     from ultralytics.utils.autobatch import check_train_batch_size
+
+    from . import accelerator
 
     world = len(devices) if isinstance(devices, (list, tuple)) else 1
     if spec and spec >= 1:
         total = int(spec)
-        return total, max(1, total // world)
+        per_gpu = max(1, total // world)
+        # An explicit batch is still bounded: a hand-set 1024 on a 48 GB card
+        # OOMs, and a batch larger than the training set spends the epoch in a
+        # single step. Clamping here keeps the config portable across cards.
+        acc = accelerator.detect()
+        ceiling = accelerator.batch_ceiling(acc.total_vram_gb)
+        if per_gpu > ceiling:
+            print(f"  batch {per_gpu}/GPU exceeds the {ceiling}/GPU ceiling for "
+                  f"{acc.total_vram_gb:.1f} GB VRAM; using {ceiling}", flush=True)
+            per_gpu = ceiling
+        if dataset_size:
+            bounded = min(per_gpu, int(dataset_size))
+            if bounded != per_gpu:
+                print(f"  batch {per_gpu}/GPU bounded by dataset size "
+                      f"({dataset_size}); using {bounded}", flush=True)
+            per_gpu = bounded
+        return per_gpu * world, per_gpu
 
-    fraction = spec if isinstance(spec, float) and 0 < spec < 1 else 0.6
+    acc = accelerator.detect()
+    if acc.backend not in ("rocm", "cuda"):
+        # Nothing worth profiling on CPU/MPS: autobatch itself falls back to
+        # the default batch there, so pick the conservative number directly.
+        return 4 * world, 4
 
-    if not torch.cuda.is_available():
-        return 4 * world, 4  # nothing to profile; conservative is fine
+    fraction = accelerator.vram_fraction_for(
+        vram_gb, acc.total_vram_gb,
+        spec if isinstance(spec, float) and 0 < spec < 1 else vram_fraction,
+    )
 
     primary = devices[0] if isinstance(devices, (list, tuple)) else devices
     try:
         # autobatch reads next(model.parameters()).device, so the module must
-        # already be on the GPU or it silently returns the fallback.
+        # already be on the accelerator or it silently returns the fallback.
         model.model.to(primary)
-        per_gpu = check_train_batch_size(
-            model=model.model, imgsz=imgsz, amp=True, batch=fraction
-        )
+        # ... and it refuses to profile while kernel autotuning is on.
+        with accelerator.cudnn_benchmark(False):
+            per_gpu = check_train_batch_size(
+                model=model.model, imgsz=imgsz, amp=amp, batch=fraction,
+                dataset_size=int(dataset_size or 0),
+            )
     except Exception as exc:  # profiling is best-effort, never fatal
         print(f"  batch auto-size failed ({type(exc).__name__}: {exc}); using 8/GPU",
               flush=True)
@@ -131,9 +168,24 @@ def resolve_batch(model, imgsz: int, spec: float, devices) -> tuple[int, int]:
     finally:
         # Profiling caches probe tensors. Leaving them resident shows up as
         # spurious OOM warnings during the first iterations.
-        torch.cuda.empty_cache()
+        try:
+            import torch
 
-    per_gpu = max(1, min(int(per_gpu), 256))
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    per_gpu = max(1, int(per_gpu))
+    ceiling = accelerator.batch_ceiling(acc.total_vram_gb)
+    if per_gpu > ceiling:
+        print(f"  batch profiled to {per_gpu}/GPU, capped at {ceiling} "
+              f"(larger batches stop helping and shrink the epoch)", flush=True)
+        per_gpu = ceiling
+    if dataset_size:
+        per_gpu = min(per_gpu, int(dataset_size))
+    print(f"  batch profiled at {fraction * 100:.0f}% of "
+          f"{acc.total_vram_gb:.1f} GB VRAM (job budget {vram_gb or 0:.0f} GB)"
+          f" -> {per_gpu}/GPU", flush=True)
     return per_gpu * world, per_gpu
 
 
@@ -202,6 +254,42 @@ def resolve_data_yaml(data_path: str, run_name: str,
     out = tmp / f"{run_name}-data.yaml"
     out.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
     return str(out)
+
+
+def dataset_size(data_yaml: str) -> int:
+    """Number of training images the resolved yaml points at.
+
+    Used to bound the profiled batch: a batch larger than the training set
+    spends an epoch in one optimiser step, which distorts the LR schedule far
+    more than the bigger batch helps. Returns 0 when the count cannot be
+    established cheaply, which callers treat as "no bound".
+    """
+    import yaml
+
+    try:
+        spec = yaml.safe_load(Path(data_yaml).read_text(encoding="utf-8")) or {}
+    except Exception:
+        return 0
+
+    base = Path(spec.get("path") or ".")
+    train = spec.get("train")
+    if not train:
+        return 0
+
+    target = Path(train)
+    if not target.is_absolute():
+        target = base / target
+    try:
+        if target.is_file():
+            # A generated stride list: one path per line.
+            return sum(1 for line in target.read_text(encoding="utf-8").splitlines()
+                       if line.strip())
+        if target.is_dir():
+            return sum(1 for p in target.iterdir()
+                       if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp"))
+    except Exception:
+        return 0
+    return 0
 
 
 def epoch_control(trainer, val_every: int, stop_marker: str,
@@ -346,8 +434,13 @@ def run_job(job, stop_marker: Path | None = None) -> dict:
 
     data_yaml = resolve_data_yaml(job.data, job.run_name,
                                   train_stride=skip, val_stride=val_stride)
+    train_images = dataset_size(data_yaml)
 
-    batch, per_gpu = resolve_batch(model, job.imgsz, job.batch, device)
+    batch, per_gpu = resolve_batch(
+        model, job.imgsz, job.batch, device,
+        vram_gb=job.vram_gb, vram_fraction=job.vram_fraction,
+        amp=job.amp, dataset_size=train_images,
+    )
     print(f"  batch {batch} total ({per_gpu}/GPU x {len(devices)} device)", flush=True)
     print(f"  data  {data_yaml}", flush=True)
     print(f"  train every {skip}th frame, val every {val_stride}th, "
@@ -380,12 +473,35 @@ def run_job(job, stop_marker: Path | None = None) -> dict:
     print(f"  {'resuming' if resume else 'starting'} {job.epochs} epochs "
           f"on device={device}", flush=True)
 
+    from . import accelerator
+
+    acc = accelerator.detect()
+    loader_workers = accelerator.workers(
+        job.workers, world=len(devices), sharing=max(1, int(job.sharing or 1)),
+        loading=job.cache is not True, total_vram_gb=acc.total_vram_gb,
+    )
+    if loader_workers != int(job.workers or 0):
+        print(f"  workers {loader_workers} "
+              f"({'auto' if not job.workers else f'requested {job.workers}'})",
+              flush=True)
+
     started = time.time()
     tuning = {}
     if job.lr0 and job.lr0 > 0:
         tuning["lr0"] = job.lr0
     if job.optimizer:
         tuning["optimizer"] = job.optimizer
+
+    if int(job.tune_iterations or 0) > 0 and not resume:
+        from .manager import HyperParameterTuner
+
+        tuner = HyperParameterTuner(job, device=device, batch=batch,
+                                    data_yaml=data_yaml)
+        # Explicit config wins over the search: a pinned lr0/optimizer is a
+        # deliberate choice, not a default the tuner should overwrite.
+        for key, value in tuner.tune().items():
+            tuning.setdefault(key, value)
+
     try:
         model.train(
             data=data_yaml,
@@ -394,7 +510,7 @@ def run_job(job, stop_marker: Path | None = None) -> dict:
             batch=batch,
             patience=job.patience,
             device=device,
-            workers=job.workers,
+            workers=loader_workers,
             cache=job.cache,
             project=str(project),
             name=job.run_name,
@@ -402,6 +518,7 @@ def run_job(job, stop_marker: Path | None = None) -> dict:
             exist_ok=True,
             save_period=save_period,
             plots=False,
+            amp=job.amp,
             mosaic=job.mosaic,
             close_mosaic=job.close_mosaic,
             fliplr=job.fliplr,

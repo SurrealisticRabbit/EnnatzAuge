@@ -42,8 +42,15 @@ class Job:
     patience: int = 20
     resume: bool = True
     save_period: int = 5
-    workers: int = 8
-    cache: bool | str = False
+    # 0 = auto: sized from the CPU count, divided between DDP ranks and between
+    # jobs that share the machine. Striding still has to decode JPEGs on the
+    # CPU, so this is the knob that decides whether the GPU waits or not.
+    workers: int = 0
+    # "auto" caches decoded images in RAM when they fit, false/"off" never
+    # caches, "disk" writes .npy files next to the images. Caching removes the
+    # per-epoch JPEG decode entirely; it is the cheapest large win on a box with
+    # memory to spare.
+    cache: bool | str = "auto"
     project: str | None = None      # resolved by the config layer
 
     # --- throughput -------------------------------------------------------
@@ -55,6 +62,44 @@ class Job:
     # Validate every Nth epoch. Keep at 1 if best.pt matters: on a skipped
     # epoch save_model compares a stale fitness and overwrites best.pt.
     val_every: int = 1
+
+    # Mixed precision. ~2x faster and half the VRAM on both ROCm and CUDA; the
+    # loss stays fp32. Turn it off only to chase a numerical difference.
+    amp: bool = True
+    # Ultralytics defaults this on, which pins cuDNN/MIOpen to deterministic
+    # kernels: slower, and it also blocks kernel autotuning. Keep it off unless
+    # a run has to be reproducible bit for bit.
+    deterministic: bool = False
+    # Randomly rescale batches by +/- this fraction. Cheap additional scale
+    # invariance; 0 disables it.
+    multi_scale: float = 0.0
+    # Rectangular batches: less padding per step, so more of the batch is real
+    # pixels. Off by default because it changes which images land together.
+    rect: bool = False
+    # Cosine LR decay instead of the default linear ramp.
+    cos_lr: bool = False
+    # torch.compile the model. Can be a solid win on ROCm/CUDA, but the first
+    # epoch pays the compilation and unsupported ops fall back silently.
+    compile: bool = False
+
+    # VRAM this job may use, in GB. 0 = the manager's fair share of the pool.
+    # Set it explicitly to pack several experiments onto one large card: the
+    # batch is then profiled against this budget instead of the whole device,
+    # which is what keeps three concurrent jobs from each sizing for 192 GB.
+    vram_gb: float = 0.0
+    # Hard override for the fraction of one device to profile against.
+    vram_fraction: float = 0.0
+
+    # --- hyperparameter search --------------------------------------------
+    # Runs Ultralytics' tuner for this many iterations before training, then
+    # trains with the winner. Each iteration is a short run of `tune_epochs`,
+    # so the cost is about tune_iterations * tune_epochs epochs.
+    #
+    # On by default: the search is a rounding error next to an 80-epoch run,
+    # and it is the only way the first run on a new dataset is not a guess.
+    # Set to 0 to skip it, or pass --tune-iterations 0.
+    tune_iterations: int = 10
+    tune_epochs: int = 10
 
     # --- augmentation -----------------------------------------------------
     mosaic: float = 1.0
@@ -86,6 +131,12 @@ class Job:
     history: list[dict] = field(default_factory=list, init=False)
     started: float | None = field(default=None, init=False)
     finished: float | None = field(default=None, init=False)
+    # Batch the profiler settled on, and the VRAM the manager reserved for it.
+    resolved_batch: int | None = field(default=None, init=False)
+    vram_allocated_gb: float = field(default=0.0, init=False)
+    # How many jobs were running at once when this one started; divides the
+    # DataLoader workers so packed jobs do not oversubscribe the CPU.
+    sharing: int = field(default=1, init=False)
 
     def __post_init__(self) -> None:
         if not self.run_name:
@@ -94,6 +145,12 @@ class Job:
             raise ValueError(f"{self.name}: epochs must be positive")
         if self.gpus < 1:
             raise ValueError(f"{self.name}: gpus must be at least 1")
+        if self.vram_gb < 0:
+            raise ValueError(f"{self.name}: vram_gb cannot be negative")
+        if not 0 <= self.vram_fraction <= 1:
+            raise ValueError(f"{self.name}: vram_fraction must be within 0..1")
+        if self.tune_iterations < 0:
+            raise ValueError(f"{self.name}: tune_iterations cannot be negative")
         if self.gpus > 1 and self.batch >= 1 and self.batch % self.gpus:
             raise ValueError(
                 f"{self.name}: batch={self.batch} must be a multiple of "

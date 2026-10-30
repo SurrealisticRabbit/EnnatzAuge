@@ -1,12 +1,16 @@
 """Check that this machine can actually run EnnatzAuge, and fix what is safe to fix.
 
     ennatzauge doctor                 # check, and create missing dirs/configs
-    ennatzauge doctor --install       # also pip-install missing packages
+    ennatzauge doctor --install       # also pip-install missing packages + torch
     ennatzauge doctor --json          # machine-readable report
 
 Exit code is 0 when the machine can train and analyse, 1 when something
 critical is wrong. Problems that cannot be fixed safely (a CPU-only PyTorch on
 a GPU host) are reported with the exact command rather than attempted.
+
+``--install`` picks the torch wheel index from the detected backend, because
+the default PyPI wheel is CPU-only on Windows and Linux: a GPU host that
+installs it silently trains on CPU.
 
 The GPU section suggests settings rather than applying them, because the right
 batch size depends on the model and resolution you are about to train -- but it
@@ -33,6 +37,15 @@ REQUIRED = {
     "cv2": "opencv-python",
     "yaml": "pyyaml",
     "huggingface_hub": "huggingface_hub",
+}
+
+# torch is installed separately because the wheel index decides which
+# accelerators the build can see at all: the default PyPI wheel is CPU-only on
+# Windows and Linux, so a GPU host that installs it silently trains on CPU.
+TORCH_INDEX = {
+    "rocm": "https://download.pytorch.org/whl/rocm6.2",
+    "cuda": "https://download.pytorch.org/whl/cu124",
+    "cpu": "https://download.pytorch.org/whl/cpu",
 }
 
 MIN_PYTHON = (3, 10)
@@ -109,18 +122,82 @@ def check_packages(report: Report, install: bool) -> None:
                    "re-run with --install")
         return
 
-    print(f"  installing {', '.join(missing)} ...", flush=True)
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", *missing],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
+    if _pip_install(report, missing):
         report.add("packages", "fixed", f"installed {', '.join(missing)}")
-        report.fixed.append(f"pip install {' '.join(missing)}")
-    else:
-        tail = (result.stderr or "").strip().splitlines()[-1:] or [""]
-        report.add("packages", "fail", f"install failed: {tail[0]}",
-                   "check network access, or install manually")
+
+
+def _pip_install(report: Report, packages: list[str],
+                 index_url: str | None = None, label: str = "") -> bool:
+    """Run pip, recording the outcome. Returns True on success."""
+    command = [sys.executable, "-m", "pip", "install", "-q"]
+    if index_url:
+        command += ["--index-url", index_url]
+    command += packages
+
+    print(f"  installing {label or ', '.join(packages)} ...", flush=True)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        report.fixed.append(" ".join(command[3:]))
+        return True
+
+    tail = (result.stderr or "").strip().splitlines()[-1:] or [""]
+    report.add("packages", "fail", f"install failed: {tail[0]}",
+               "check network access, or install manually")
+    return False
+
+
+def check_torch(report: Report, install: bool, backend: str) -> None:
+    """Ensure torch is present, and that it is the build this host needs.
+
+    A CPU-only wheel on a GPU host is the single most expensive silent
+    misconfiguration here: everything runs, just 20-50x slower. The wheel index
+    is what decides it, so it is chosen from the detected backend rather than
+    left to pip's default.
+    """
+    try:
+        import torch
+    except ImportError:
+        if not install:
+            report.add("pytorch", "warn", "torch not installed",
+                       "re-run with --install")
+            return
+        index = TORCH_INDEX.get(backend, TORCH_INDEX["cpu"])
+        if _pip_install(report, ["torch", "torchvision"], index,
+                        f"torch ({backend} build)"):
+            report.add("pytorch", "fixed", f"installed torch for {backend}")
+        return
+
+    # Present. Warn only when the build cannot see the hardware it should.
+    if backend in ("cuda", "rocm") and not torch.cuda.is_available():
+        index = TORCH_INDEX[backend]
+        report.add("pytorch", "warn",
+                   f"{torch.__version__} cannot see the {backend} device",
+                   f"pip install torch torchvision --index-url {index}")
+
+
+def _detect_backend() -> str:
+    """Best guess at which torch build this host needs.
+
+    Runs before torch is necessarily installed, so it falls back to looking for
+    the driver itself: ``nvidia-smi`` for CUDA, ``rocm-smi``/``/dev/kfd`` for
+    ROCm. Getting this wrong is not fatal, it just means the CPU wheel is
+    installed and the GPU section reports the mismatch.
+    """
+    try:
+        import torch
+
+        if getattr(torch.version, "hip", None):
+            return "rocm"
+        if torch.version.cuda:
+            return "cuda"
+    except ImportError:
+        pass
+
+    if shutil.which("rocm-smi") or Path("/dev/kfd").exists():
+        return "rocm"
+    if shutil.which("nvidia-smi"):
+        return "cuda"
+    return "cpu"
 
 
 def check_directories(report: Report, paths: Paths) -> None:
@@ -327,8 +404,8 @@ def check_analysis_backend(report: Report) -> None:
 
 
 def check_gpu(report: Report) -> dict:
-    """Inspect CUDA and set the flags that are unambiguous wins."""
-    info: dict = {"available": False, "count": 0, "devices": []}
+    """Inspect CUDA/ROCm and set the flags that are unambiguous wins."""
+    info: dict = {"available": False, "count": 0, "devices": [], "backend": "cpu"}
 
     try:
         import torch
@@ -338,11 +415,22 @@ def check_gpu(report: Report) -> dict:
         return info
 
     cuda_build = torch.version.cuda
-    report.add("pytorch", "ok", f"{torch.__version__} (CUDA {cuda_build or 'none'})")
+    hip_build = getattr(torch.version, "hip", None)
+    if hip_build:
+        info["backend"] = "rocm"
+        report.add("pytorch", "ok",
+                   f"{torch.__version__} (ROCm {hip_build})")
+    else:
+        info["backend"] = "cuda" if cuda_build else "cpu"
+        report.add("pytorch", "ok",
+                   f"{torch.__version__} (CUDA {cuda_build or 'none'})")
 
     info["available"] = bool(torch.cuda.is_available())
     if not info["available"]:
-        if cuda_build is None:
+        if hip_build:
+            report.add("rocm", "warn", "ROCm build present, no device visible",
+                       "check /dev/kfd permissions and HSA_OVERRIDE_GFX_VERSION")
+        elif cuda_build is None:
             report.add("cuda", "warn", "CPU-only PyTorch build",
                        "on a GPU host: pip install torch --index-url "
                        "https://download.pytorch.org/whl/cu124")
@@ -360,30 +448,92 @@ def check_gpu(report: Report) -> dict:
             "index": index,
             "name": props.name,
             "vram_gb": round(props.total_memory / 1e9, 1),
-            "capability": f"{props.major}.{props.minor}",
+            "capability": (getattr(props, "gcnArchName", None)
+                           or f"{props.major}.{props.minor}"),
         })
 
     report.add("gpu", "ok", "; ".join(
         f"{d['index']}: {d['name']} {d['vram_gb']}GB" for d in info["devices"]))
 
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-        info["tf32"] = True
-        report.add("tf32", "fixed", "enabled for matmul and cuDNN")
-    except Exception as exc:
-        report.add("tf32", "warn", str(exc))
+    if info["backend"] == "rocm":
+        check_rocm(report, info)
+    else:
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            info["tf32"] = True
+            report.add("tf32", "fixed", "enabled for matmul and cuDNN")
+        except Exception as exc:
+            report.add("tf32", "warn", str(exc))
 
-    check_topology(report, count)
+    check_topology(report, count, info["backend"])
     check_gpu_headroom(report, torch)
     return info
 
 
-def check_topology(report: Report, count: int) -> None:
+def check_rocm(report: Report, info: dict) -> None:
+    """Report the ROCm-specific knobs that decide AMD throughput."""
+    from ..train import accelerator
+
+    arch = info["devices"][0]["capability"] if info["devices"] else ""
+    if arch:
+        report.add("rocm arch", "ok", arch,
+                   "set HSA_OVERRIDE_GFX_VERSION only if the kernel is "
+                   "missing for this part")
+
+    # hipBLASLt is the single biggest GEMM win on CDNA3 and is off by default
+    # in some wheels.
+    report.add("rocm gemm", "fixed",
+               "HIPBLASLT_ALLOW_TF32=1, MIOpen find mode FAST",
+               "applied automatically by the training entry point")
+
+    smi = accelerator.rocm_smi()
+    if smi:
+        report.add("rocm-smi", "ok", smi.splitlines()[0][:120])
+    else:
+        report.add("rocm-smi", "skip", "rocm-smi not on PATH",
+                   "install rocm-smi for per-device VRAM and clock reporting")
+
+    hwaccel = accelerator.ffmpeg_hwaccel()
+    if hwaccel:
+        report.add("video decode", "ok", f"ffmpeg {hwaccel} available",
+                   "VCN can decode frames without loading the CPU")
+    else:
+        report.add("video decode", "warn", "no hardware decode path",
+                   "install ffmpeg with vaapi support to use the VCN engines")
+
+    if accelerator.is_large_vram(info["devices"][0]["vram_gb"] if info["devices"] else 0):
+        report.add("rocm capacity", "ok",
+                   f"batch ceiling {accelerator.batch_ceiling(info['devices'][0]['vram_gb'])}, "
+                   f"up to {accelerator.max_workers_for(info['devices'][0]['vram_gb'])} "
+                   f"loader workers",
+                   "split the card with vram_gb= to run experiments concurrently")
+
+
+def check_topology(report: Report, count: int, backend: str = "cuda") -> None:
     """For multi-GPU hosts, confirm DDP will not cross the network."""
     if count < 2:
         return
+
+    if backend == "rocm":
+        smi = shutil.which("rocm-smi")
+        if not smi:
+            report.add("gpu topology", "skip", "rocm-smi not on PATH")
+            return
+        try:
+            result = subprocess.run([smi, "--showtopo"], capture_output=True,
+                                    text=True, timeout=20)
+            text = result.stdout or ""
+        except Exception as exc:
+            report.add("gpu topology", "skip", f"could not query: {exc}")
+            return
+        if "XGMI" in text.upper():
+            report.add("gpu topology", "ok", "XGMI between devices")
+        else:
+            report.add("gpu topology", "ok", "PCIe-connected, single host")
+        return
+
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
         report.add("gpu topology", "skip", "nvidia-smi not on PATH")
@@ -421,13 +571,23 @@ def check_gpu_headroom(report: Report, torch) -> None:
 
 def recommend(report: Report, gpu: dict) -> None:
     """Turn the detected hardware into concrete training settings."""
+    from ..train import accelerator
+
     cpu_count = os.cpu_count() or 4
 
     if gpu["count"]:
         vram = max(d["vram_gb"] for d in gpu["devices"])
+        ceiling = accelerator.batch_ceiling(vram)
         # Measured for yolo26m at imgsz=1280: batch 8 needs ~21 GB, 16 needs
         # ~42 GB. Under 16 GB must drop the batch or the resolution.
-        if vram >= 40:
+        if vram >= accelerator.LARGE_VRAM_GB:
+            # A 192 GB part is not a bigger L40, it is several L40s. The win
+            # is running experiments side by side, not one enormous batch.
+            per_job = max(32, ceiling // 4)
+            batch = (f"up to {ceiling} at imgsz=1280 in one job, but prefer "
+                     f"4 concurrent jobs at batch={per_job} "
+                     f"(vram_gb={vram / 4:.0f})")
+        elif vram >= 40:
             batch = "8-16 at imgsz=1280"
         elif vram >= 20:
             batch = "8 at imgsz=1280"
@@ -438,9 +598,20 @@ def recommend(report: Report, gpu: dict) -> None:
         report.add("recommend batch", "ok", batch)
 
         # Leave a core for the parent process; Ultralytics opens 4 per worker.
-        workers = max(2, min(8, cpu_count // max(1, gpu["count"])))
+        workers = accelerator.max_workers_for(vram, cpu_count)
         report.add("recommend workers", "ok", str(workers))
         report.add("recommend amp", "ok", "leave amp=True (default, ~2x faster)")
+
+        if vram >= accelerator.LARGE_VRAM_GB:
+            report.add("recommend cache", "ok", "cache='disk'",
+                       "a 192 GB card still cannot hold a 4K frame set in RAM; "
+                       "disk caching keeps the loader fed")
+            report.add("recommend tune", "ok",
+                       "tune_iterations=20 tune_epochs=10",
+                       "default is 10; the search is cheap next to a full run "
+                       "on this card, so widen it")
+            report.add("recommend compile", "ok", "compile=True",
+                       "torch.compile pays for itself over a long run")
         if gpu["count"] > 1:
             report.add("recommend gpus", "ok",
                        f"{gpu['count']} visible; DDP gives ~1.8x for 2x cost, "
@@ -475,6 +646,9 @@ def run(args: argparse.Namespace) -> int:
     check_platform(report)
     check_python(report)
     check_packages(report, args.install)
+    # torch is checked before the GPU section so that --install can put the
+    # right build in place and the GPU section then reports on real hardware.
+    check_torch(report, args.install, _detect_backend())
 
     if args.no_fix:
         for name, path in (("configs", paths.root / "configs"),

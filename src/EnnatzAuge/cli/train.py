@@ -20,12 +20,31 @@ from ..paths import Paths
 from ..train.jobs import Job
 from ..train.manager import Manager, describe_devices, visible_gpu_count
 
+
+def _bool(value: str) -> bool:
+    """argparse type for tri-state flags: ``--amp true`` / ``--amp false``."""
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "y"):
+        return True
+    if text in ("0", "false", "no", "off", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected a boolean, got {value!r}")
+
+
 # Keys a caller may override from the command line.
 OVERRIDABLE = {
     "epochs": int, "imgsz": int, "batch": float, "gpus": int,
     "patience": int, "workers": int, "save_period": int,
     "dataset_skip_interval": int, "val_stride": int, "val_every": int,
     "mosaic": float, "close_mosaic": int, "fliplr": float, "lr0": float,
+    # VRAM budgeting: how several experiments share one large card.
+    "vram_gb": float, "vram_fraction": float,
+    # Hyperparameter search.
+    "tune_iterations": int, "tune_epochs": int,
+    # Throughput knobs that matter most on a data-centre part.
+    "optimizer": str, "cache": str, "amp": _bool, "compile": _bool,
+    "multi_scale": _bool, "rect": _bool, "cos_lr": _bool,
+    "deterministic": _bool,
 }
 
 
@@ -35,6 +54,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--job", help="only run the job with this name")
     parser.add_argument("--max-gpus", type=int, default=None,
                         help="GPU slots to schedule against (default: detected)")
+    parser.add_argument("--vram-pool", type=float, default=None,
+                        help="GB of VRAM to schedule against (default: detected)")
+    parser.add_argument("--max-concurrent", type=int, default=None,
+                        help="cap simultaneous jobs regardless of VRAM")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the resolved jobs and exit")
     parser.add_argument("--model",
@@ -92,35 +115,46 @@ def run(args: argparse.Namespace) -> int:
     paths = Paths()
     paths.ensure()
 
+    from ..train import accelerator
+
+    acc = accelerator.detect()
     detected = visible_gpu_count()
     print(f"root     {paths.root}")
-    print(f"gpus     {detected if detected else 'none (cpu)'}")
-    for line in describe_devices():
+    for line in acc.describe():
         print(f"           {line}")
+    if not acc.is_gpu:
+        print(f"gpus     none (cpu, {detected} cuda device(s))")
 
     jobs = _jobs_from_args(paths, args)
     if not jobs:
         return 1
 
     missing = [j for j in jobs if not Path(j.data).exists()]
-    if missing:
+    if missing and not args.dry_run:
         for job in missing:
             print(f"error: dataset yaml not found: {job.data}")
         print(f"       run 'ennatzauge build' first, or fix the path in "
               f"{paths.config(args.config)}")
         return 1
 
-    print(f"\n{'job':<20}{'epochs':>7}{'imgsz':>7}{'batch':>7}{'gpus':>6}  data")
+    print(f"\n{'job':<20}{'epochs':>7}{'imgsz':>7}{'batch':>7}{'gpus':>6}"
+          f"{'vram':>7}  data")
     for job in jobs:
+        vram = f"{job.vram_gb:.0f}G" if job.vram_gb else (
+            f"{job.vram_fraction * 100:.0f}%" if job.vram_fraction else "auto")
         print(f"{job.name:<20}{job.epochs:>7}{job.imgsz:>7}"
-              f"{str(job.batch):>7}{job.gpus:>6}  {job.data}")
+              f"{str(job.batch):>7}{job.gpus:>6}{vram:>7}  {job.data}")
 
     if args.dry_run:
+        for job in missing:
+            print(f"\nwarning: dataset yaml not found: {job.data}")
         print("\ndry run, nothing started")
         return 0
 
     manager = Manager(max_gpus=args.max_gpus or max(1, detected),
-                      project=paths.runs)
+                      project=paths.runs,
+                      vram_pool_gb=args.vram_pool,
+                      max_concurrent=args.max_concurrent)
     for job in jobs:
         manager.add(job)
 

@@ -2,6 +2,29 @@
 #
 # Paths are relative to the EnnatzAuge root, so this works from any directory.
 # Anything omitted falls back to the defaults in train/jobs.py.
+#
+# Hardware notes
+# --------------
+# batch: -1 profiles the card you actually allocated, so the same file is
+#   correct on a 48 GB L40 and a 192 GB MI300X. The profile is clamped to
+#   accelerator.batch_ceiling() (512 on >=80 GB, 128 otherwise) and to the
+#   size of the training set, so it will not pick a batch that cannot finish
+#   an epoch.
+#
+# vram_gb / vram_fraction: how much of the card this job may claim. Jobs are
+#   admitted by the manager only when their budget fits the free pool, so on a
+#   192 GB part you can list several jobs and they will run side by side
+#   instead of queueing. Leave both unset to split the pool evenly across
+#   --max-gpus slots.
+#
+# tune_iterations / tune_epochs: run Ultralytics' hyperparameter search before
+#   training, then train with the winner. On by default (10 x 10 epochs) --
+#   the search is a rounding error next to an 80-epoch run. Explicit
+#   lr0/optimizer values below win over the search result. Set
+#   tune_iterations: 0 to skip it.
+#
+# On ROCm the entry point sets MIOPEN_FIND_MODE=FAST, HIPBLASLT_ALLOW_TF32=1,
+# PYTORCH_HIP_ALLOC_CONF=expandable_segments:True and HSA_ENABLE_SDMA=0.
 
 jobs:
   - name: players
@@ -22,6 +45,9 @@ jobs:
     mosaic: 0.5
     close_mosaic: 25
     fliplr: 0.5
+    # vram_gb: 48          # uncomment to pin this job's share of the card
+    # tune_iterations: 10  # hyperparameter search before training (default 10)
+    # tune_epochs: 10
 
   - name: pitch
     run_name: pitch            # pinned, so re-running resumes this run
